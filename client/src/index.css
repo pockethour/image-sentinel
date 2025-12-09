@@ -1,0 +1,57 @@
+/* index.css: 全局基本样式 */
+body {
+    /* 使用您之前 App.jsx 中定义的字体 */
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    /* 设置背景色，与 App.jsx 中的 body 样式保持一致 */
+    background-color: #f8f9fa;
+    /* 确保页面主体内容充满整个视口高度 */
+    min-height: 100vh;
+}
+
+/* 之前在 App.jsx 中定义的 Hero 区样式 */
+.hero-section {
+    /* 使用渐变背景，使页面更具现代感 */
+    background: linear-gradient(135deg, #0d6efd 0%, #0dcaf0 100%);
+    color: white;
+    padding: 60px 0;
+    margin-bottom: 40px;
+    /* 圆角设计，使 Hero 区底部圆润 */
+    border-radius: 0 0 20px 20px;
+}
+
+/* 上传框样式 (Upload Box) */
+.upload-box {
+    border: 2px dashed #dee2e6;
+    border-radius: 10px;
+    padding: 40px;
+    text-align: center;
+    background: white;
+    transition: all 0.3s;
+    cursor: pointer;
+}
+
+    .upload-box:hover {
+        /* 悬停时边框和背景变化，提供视觉反馈 */
+        border-color: #0d6efd;
+        background-color: #f1f8ff;
+    }
+
+/* 步骤卡片样式 (Step Card) */
+.step-card {
+    border: none;
+    /* 细微阴影，使卡片浮动效果 */
+    box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+    transition: transform 0.2s;
+}
+
+    .step-card:hover {
+        /* 悬停时轻微上浮 */
+        transform: translateY(-5px);
+    }
+
+/* 确保根元素 #root 适应 Flex 布局，使 Footer 保持在底部 */
+#root {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
