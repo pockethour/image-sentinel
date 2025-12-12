@@ -6,13 +6,16 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./database');
+const axios = require('axios'); // [新增] 用于调用 C++ 服务
 
-// ⬇️⬇️⬇️ 修复点：只引入核心 SDK，移除报错的 lib/form ⬇️⬇️⬇️
+// 引入支付宝 SDK
 const { AlipaySdk } = require('alipay-sdk');
-// ⬆️⬆️⬆️ 移除结束 ⬆️⬆️⬆️
 
 const app = express();
 const PORT = 8080;
+
+// [新增] C++ 核心微服务地址 (内网环回地址，速度快且安全)
+const CPP_SERVICE_URL = 'http://127.0.0.1:9000';
 
 // --- 支付宝初始化 ---
 const alipaySdk = new AlipaySdk({
@@ -67,23 +70,55 @@ app.post('/api/upload', upload.single('image'), (req, res) => {
     }
 });
 
-// 2. 处理 (模拟)
+// 2. 处理 (已修改：调用真实 C++ 微服务)
 app.post('/api/process', async (req, res) => {
     const { fileId, algorithm } = req.body;
+
+    // 1. 从数据库获取文件信息
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
     if (!file) return res.status(404).json({ error: '文件不存在' });
 
-    const processedFilename = `processed_${file.storedName}`;
+    // 2. 定义输出文件名和路径
+    // 注意：确保后缀名与 C++ 输出一致 (通常是 .png 或保持原格式)
+    const processedFilename = `processed_${fileId}_${algorithm}.png`;
     const outputPath = path.join(OUTPUT_DIR, processedFilename);
 
-    // 模拟 C++ 处理耗时
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    fs.copyFileSync(file.uploadPath, outputPath);
+    try {
+        console.log(`[Node] Calling C++ Service for ${fileId} using ${algorithm}...`);
 
-    db.prepare('UPDATE files SET processedName = ?, outputPath = ? WHERE id = ?')
-        .run(processedFilename, outputPath, fileId);
+        // 3. 发起 HTTP 请求给 C++ 服务
+        // 关键点：必须使用 path.resolve 将路径转换为绝对路径，因为 C++ 服务不知道 Node 的相对路径上下文
+        const cppResponse = await axios.post(`${CPP_SERVICE_URL}/process`, {
+            inputPath: path.resolve(file.uploadPath),
+            outputPath: path.resolve(outputPath),
+            algorithm: algorithm
+        });
 
-    res.json({ success: true, previewUrl: `/api/preview/${fileId}` });
+        // 4. 检查 C++ 服务返回的结果
+        if (cppResponse.data.success) {
+            // C++ 处理成功，更新数据库
+            db.prepare('UPDATE files SET processedName = ?, outputPath = ? WHERE id = ?')
+                .run(processedFilename, outputPath, fileId);
+
+            // 返回预览 URL
+            res.json({ success: true, previewUrl: `/api/preview/${fileId}` });
+        } else {
+            // C++ 服务逻辑报错 (如 OpenCV 读取失败)
+            throw new Error(cppResponse.data.error || 'Unknown C++ Service Error');
+        }
+
+    } catch (err) {
+        console.error('Processing Error:', err.message);
+
+        // 区分错误类型
+        if (err.code === 'ECONNREFUSED') {
+            return res.status(503).json({ error: '核心算法服务未启动，请联系管理员' });
+        }
+
+        res.status(500).json({
+            error: '图像处理失败: ' + (err.response?.data?.error || err.message)
+        });
+    }
 });
 
 // 3. 预览
@@ -93,7 +128,7 @@ app.get('/api/preview/:id', (req, res) => {
     res.sendFile(file.outputPath);
 });
 
-// 4. 【核心】发起支付 (已修复：使用 pageExec)
+// 4. 发起支付
 app.post('/api/pay', async (req, res) => {
     const { fileId } = req.body;
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
@@ -102,9 +137,9 @@ app.post('/api/pay', async (req, res) => {
     const outTradeNo = `${fileId}_${Date.now()}`;
 
     try {
-        // ⬇️⬇️⬇️ 修复点：改用 pageExec，不需要手动创建 FormData ⬇️⬇️⬇️
+        // 使用 pageExec 生成支付表单 HTML
         const result = await alipaySdk.pageExec('alipay.trade.page.pay', {
-            method: 'POST', // 指定 POST，SDK 会自动生成 HTML 表单
+            method: 'POST',
             bizContent: {
                 out_trade_no: outTradeNo,
                 product_code: 'FAST_INSTANT_TRADE_PAY',
@@ -112,12 +147,10 @@ app.post('/api/pay', async (req, res) => {
                 subject: 'Image Sentinel Service',
                 body: `File ID: ${fileId}`,
             },
-            // 顶层参数直接放在这里
             returnUrl: `${process.env.SERVER_HOST}/?status=paid&fileId=${fileId}`,
             notifyUrl: `${process.env.SERVER_HOST}/api/payment/notify`,
         });
 
-        // result 直接就是 HTML 表单字符串
         res.json({ success: true, formHtml: result });
 
     } catch (err) {
@@ -131,6 +164,7 @@ app.post('/api/payment/notify', (req, res) => {
     const params = req.body;
     console.log('Received Alipay Notify:', params);
 
+    // 验签
     const checkResult = alipaySdk.checkNotifySign(params);
 
     if (checkResult) {
@@ -153,6 +187,8 @@ app.get('/api/download/:id', (req, res) => {
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id);
     if (!file) return res.status(404).send('文件不存在');
     if (file.isPaid !== 1) return res.status(403).send('请先支付费用');
+
+    // 下载时使用原始文件名加前缀
     res.download(file.outputPath, `Sentinel_${file.originalName}`);
 });
 
@@ -167,40 +203,3 @@ app.get('*', (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
-
-
-// ⬇️⬇️⬇️ 自定义 AlipayFormData 类 (解决 import 报错) ⬇️⬇️⬇️
-// 这是一个简单的 Mock 类，完全兼容 SDK 的要求
-class AlipayFormData {
-    constructor() {
-        this.method = 'post';
-        this.fields = [];
-        this.files = [];
-    }
-
-    setMethod(method) {
-        this.method = method;
-    }
-
-    addField(name, value) {
-        this.fields.push({ name, value });
-    }
-
-    getFields() {
-        return this.fields;
-    }
-
-    getMethod() {
-        return this.method;
-    }
-
-    // 虽然 Page Pay 用不到文件上传，但为了完整性加上
-    addFile(name, file) {
-        this.files.push({ name, file });
-    }
-
-    getFiles() {
-        return this.files;
-    }
-}
-// ⬆️⬆️⬆️ 定义结束 ⬆️⬆️⬆️
