@@ -1,44 +1,36 @@
 ﻿import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-import { FaShieldAlt, FaCloudUploadAlt, FaMagic, FaDownload, FaLock, FaCheckCircle } from 'react-icons/fa';
+// 请确保安装: npm install react-icons
+import { FaShieldAlt, FaCloudUploadAlt, FaMagic, FaDownload, FaLock, FaCheckCircle, FaExclamationTriangle, FaFingerprint } from 'react-icons/fa';
 
-// 基础 API 路径 (相对路径，由 Nginx/Express 转发)
 const API_BASE = '/api';
 
 function App() {
-    // --- 状态管理 ---
     const [fileId, setFileId] = useState(null);
-    // 状态机: IDLE (空闲) -> UPLOADING (上传中) -> UPLOADED (已上传) -> PROCESSING (处理中) -> READY_PAY (待支付) -> PAID (已支付)
-    const [status, setStatus] = useState('IDLE');
+    const [status, setStatus] = useState('IDLE'); // IDLE, UPLOADING, UPLOADED, PROCESSING, READY_PAY, PAID
     const [previewUrl, setPreviewUrl] = useState(null);
+    const [algorithm, setAlgorithm] = useState('');
+    const [evidence, setEvidence] = useState(null); // [核心] 存储 C++ 的证据数据
     const [error, setError] = useState('');
 
-    // --- 核心逻辑 1: 检测支付回调 ---
-    // 当用户支付完成后，支付宝会将页面重定向回 http://你的域名/?status=paid&fileId=xxx
     useEffect(() => {
         const query = new URLSearchParams(window.location.search);
-        const urlStatus = query.get('status');
-        const urlFileId = query.get('fileId');
-
-        if (urlStatus === 'paid' && urlFileId) {
-            setFileId(urlFileId);
+        if (query.get('status') === 'paid' && query.get('fileId')) {
+            setFileId(query.get('fileId'));
             setStatus('PAID');
-            // 可选：清理 URL 栏的参数，让界面更干净
-            window.history.replaceState({}, document.title, "/");
+            window.history.replaceState({}, '', '/');
         }
     }, []);
 
-    // --- 核心逻辑 2: 文件上传 ---
     const handleFileChange = async (e) => {
         const file = e.target.files[0];
         if (!file) return;
-
         const formData = new FormData();
         formData.append('image', file);
-
+        
         setStatus('UPLOADING');
         setError('');
-
+        
         try {
             const res = await axios.post(`${API_BASE}/upload`, formData);
             if (res.data.success) {
@@ -46,229 +38,186 @@ function App() {
                 setStatus('UPLOADED');
             }
         } catch (err) {
-            console.error(err);
-            setError('上传失败，请检查网络或图片格式');
+            setError('上传失败');
             setStatus('IDLE');
         }
     };
 
-    // --- 核心逻辑 3: AI 处理调用 ---
-    const startProcessing = async (algorithm) => {
+    const startProcessing = async (algo) => {
         setStatus('PROCESSING');
-        setError('');
+        setAlgorithm(algo);
         try {
             const res = await axios.post(`${API_BASE}/process`, {
                 fileId,
-                algorithm
+                algorithm: algo
             });
+
             if (res.data.success) {
-                // 后端返回的 previewUrl 已经是相对路径
                 setPreviewUrl(res.data.previewUrl);
+                // [核心] 提取除了 success/previewUrl 之外的所有数据作为证据
+                const { success, previewUrl, ...rest } = res.data;
+                setEvidence(rest); 
                 setStatus('READY_PAY');
             }
         } catch (err) {
-            console.error(err);
-            setError('处理失败：' + (err.response?.data?.error || '服务器内部错误'));
-            setStatus('UPLOADED'); // 回退到已上传状态
+            setError(err.response?.data?.error || '处理失败');
+            setStatus('UPLOADED');
         }
     };
 
-    // --- 核心逻辑 4: 发起真实支付宝支付 ---
     const handlePayment = async () => {
-        setError('');
         try {
-            // 1. 请求后端，获取支付宝 HTML 表单
             const res = await axios.post(`${API_BASE}/pay`, { fileId });
-
-            if (res.data.success && res.data.formHtml) {
-                // 2. 自动跳转逻辑
-                // 支付宝返回的是一个完整的 HTML (含 <form> 和 <script>document.forms[0].submit()</script>)
-                // 直接写入文档流，浏览器会自动执行脚本并跳转
+            if (res.data.success) {
                 document.write(res.data.formHtml);
                 document.close();
-            } else {
-                setError('支付初始化异常：未获取到支付表单');
             }
         } catch (err) {
-            console.error(err);
-            setError('支付发起失败，请稍后重试');
+            setError('支付初始化失败');
         }
     };
 
-    // --- 核心逻辑 5: 下载文件 ---
-    const handleDownload = () => {
-        if (!fileId) return;
-        // 在新窗口打开下载链接
-        window.open(`${API_BASE}/download/${fileId}`, '_blank');
-    };
-
-    // --- 辅助：重置流程 ---
     const resetFlow = () => {
         setStatus('IDLE');
         setFileId(null);
         setPreviewUrl(null);
+        setEvidence(null);
         setError('');
     };
 
-    // --- 渲染界面 ---
     return (
-        <div className="min-vh-100 d-flex flex-column">
-            {/* 顶部 Hero 区域 */}
-            <div className="hero-section text-center">
-                <div className="container">
-                    <h1 className="display-4 fw-bold mb-3">
-                        <FaShieldAlt className="me-3" />
-                        图像卫士 Image Sentinel
-                    </h1>
-                    <p className="lead opacity-75">
-                        企业级隐形水印 & 图像防篡改取证服务<br />
-                        保护您的创作版权，识别 AI 生成痕迹
-                    </p>
-                </div>
+        <div className="min-vh-100 bg-light font-sans-serif">
+            {/* Header */}
+            <div className="bg-dark text-white text-center py-5 mb-4">
+                <h1 className="fw-bold"><FaShieldAlt className="text-warning me-2"/>图像卫士 Sentinel</h1>
+                <p className="opacity-75">企业级隐形水印 & AI 取证平台</p>
             </div>
 
-            {/* 主内容区域 */}
-            <div className="container flex-grow-1">
-                <div className="row justify-content-center">
-                    <div className="col-md-8">
+            <div className="container" style={{maxWidth: '900px'}}>
+                {error && <div className="alert alert-danger">{error}</div>}
 
-                        {/* 错误提示条 */}
-                        {error && (
-                            <div className="alert alert-danger shadow-sm text-center" role="alert">
-                                {error}
+                <div className="card shadow-lg border-0">
+                    <div className="card-body p-5">
+                        
+                        {/* 1. Upload */}
+                        {(status === 'IDLE' || status === 'UPLOADED') && (
+                            <div className="text-center">
+                                <label className="d-block w-100 p-5 border border-2 border-dashed rounded cursor-pointer bg-white">
+                                    <input type="file" hidden onChange={handleFileChange} accept="image/*" />
+                                    {status === 'UPLOADED' ? (
+                                        <div className="text-success animate__animated animate__bounceIn">
+                                            <FaCheckCircle size={50} className="mb-3"/>
+                                            <h4>图片就绪</h4>
+                                        </div>
+                                    ) : (
+                                        <div className="text-muted">
+                                            <FaCloudUploadAlt size={50} className="mb-3 text-primary"/>
+                                            <h5>点击上传图片</h5>
+                                            <p className="small">支持 JPG/PNG (Max 50MB)</p>
+                                        </div>
+                                    )}
+                                </label>
+
+                                {status === 'UPLOADED' && (
+                                    <div className="row g-3 mt-4">
+                                        <div className="col-md-6">
+                                            <button onClick={() => startProcessing('watermark')} className="btn btn-outline-primary w-100 p-4 h-100 border-2 text-start">
+                                                <h5 className="fw-bold"><FaLock className="me-2"/>隐形水印</h5>
+                                                <small className="text-muted d-block mt-2">嵌入肉眼不可见版权信息，抗截图、抗压缩。</small>
+                                            </button>
+                                        </div>
+                                        <div className="col-md-6">
+                                            <button onClick={() => startProcessing('forensics')} className="btn btn-outline-danger w-100 p-4 h-100 border-2 text-start">
+                                                <h5 className="fw-bold"><FaMagic className="me-2"/>防篡改取证</h5>
+                                                <small className="text-muted d-block mt-2">生成 ELA 热力图，计算真实性评分。</small>
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         )}
 
-                        {/* 核心卡片 */}
-                        <div className="card p-4 step-card mb-5 bg-white">
+                        {/* 2. Processing */}
+                        {(status === 'UPLOADING' || status === 'PROCESSING') && (
+                            <div className="text-center py-5">
+                                <div className="spinner-border text-primary mb-3" style={{width: '3rem', height: '3rem'}}></div>
+                                <h5 className="text-muted">{status === 'UPLOADING' ? '正在加密上传...' : 'C++ 核心引擎计算中...'}</h5>
+                            </div>
+                        )}
 
-                            {/* 状态 1: 上传 / 选择文件 */}
-                            {(status === 'IDLE' || status === 'UPLOADED') && (
-                                <div className="text-center">
-                                    <h3 className="mb-4 text-muted">第一步：上传待保护的图片</h3>
+                        {/* 3. Evidence & Pay (核心付费转化页) */}
+                        {status === 'READY_PAY' && evidence && (
+                            <div className="animate__animated animate__fadeIn">
+                                <div className="text-center mb-4">
+                                    <h3 className="fw-bold text-success"><FaCheckCircle className="me-2"/>分析完成</h3>
+                                    <p className="text-muted">请查阅下方的分析摘要</p>
+                                </div>
 
-                                    <label className="upload-box w-100 d-block">
-                                        <input type="file" hidden onChange={handleFileChange} accept="image/jpeg,image/png" />
-                                        {status === 'UPLOADED' ? (
-                                            <div className="text-success">
-                                                <FaCheckCircle size={50} className="mb-3" />
-                                                <h5>文件上传成功！</h5>
-                                                <p className="text-muted">点击下方按钮选择服务</p>
-                                            </div>
+                                <div className="row g-0 border rounded overflow-hidden mb-4 shadow-sm">
+                                    {/* 左侧：预览图 */}
+                                    <div className="col-md-6 bg-dark d-flex align-items-center justify-content-center p-3">
+                                        <img src={previewUrl} className="img-fluid rounded" style={{maxHeight: '300px'}} alt="Result" />
+                                    </div>
+                                    
+                                    {/* 右侧：证据卡片 */}
+                                    <div className="col-md-6 bg-white p-4 d-flex flex-column justify-content-center">
+                                        {algorithm === 'watermark' ? (
+                                            <>
+                                                <h5 className="text-primary fw-bold mb-3"><FaFingerprint className="me-2"/>嵌入验证报告</h5>
+                                                <div className="alert alert-success border-0 bg-success bg-opacity-10 mb-3">
+                                                    <small className="fw-bold text-uppercase text-success">Extracted ID</small>
+                                                    <div className="fs-5 font-monospace text-dark">{evidence.extractedId}</div>
+                                                </div>
+                                                <ul className="list-unstyled small text-muted mb-0">
+                                                    <li className="mb-1">✅ 频域嵌入强度: {evidence.strength}</li>
+                                                    <li>✅ 鲁棒性: {evidence.robustness}</li>
+                                                </ul>
+                                            </>
                                         ) : (
-                                            <div>
-                                                <FaCloudUploadAlt size={50} className="text-primary mb-3" />
-                                                <h5 className="text-primary">点击或拖拽上传图片</h5>
-                                                <p className="text-secondary small">支持 JPG, PNG (最大 20MB)</p>
-                                            </div>
+                                            <>
+                                                <h5 className="text-danger fw-bold mb-3"><FaExclamationTriangle className="me-2"/>真实性分析</h5>
+                                                <div className="d-flex align-items-end mb-3">
+                                                    <span className={`display-4 fw-bold lh-1 me-2 ${evidence.score < 60 ? 'text-danger' : 'text-success'}`}>
+                                                        {evidence.score}
+                                                    </span>
+                                                    <span className="text-muted mb-2">/ 100 分</span>
+                                                </div>
+                                                <ul className="list-unstyled small text-muted mb-0">
+                                                    <li className="mb-1">
+                                                        {evidence.riskLevel === 'High' ? '❌ 高风险: 检测到明显篡改痕迹' : '✅ 低风险: 未见异常'}
+                                                    </li>
+                                                    <li>📊 异常强度: {evidence.anomalyIntensity.toFixed(2)}</li>
+                                                </ul>
+                                            </>
                                         )}
-                                    </label>
-
-                                    {/* 状态 2: 选择算法 (仅在文件上传后显示) */}
-                                    {status === 'UPLOADED' && (
-                                        <div className="mt-4 animate__animated animate__fadeIn">
-                                            <h3 className="mb-4">第二步：选择防护服务</h3>
-                                            <div className="row g-3">
-                                                <div className="col-md-6">
-                                                    <button onClick={() => startProcessing('watermark')} className="btn btn-outline-primary w-100 p-4 h-100 border-2">
-                                                        <FaLock size={28} className="mb-3" /><br />
-                                                        <strong className="fs-5">隐形水印嵌入</strong>
-                                                        <p className="small m-0 mt-2 text-muted">肉眼不可见，抗截图压缩，用于版权追踪</p>
-                                                    </button>
-                                                </div>
-                                                <div className="col-md-6">
-                                                    <button onClick={() => startProcessing('forensics')} className="btn btn-outline-dark w-100 p-4 h-100 border-2">
-                                                        <FaMagic size={28} className="mb-3" /><br />
-                                                        <strong className="fs-5">防篡改检测</strong>
-                                                        <p className="small m-0 mt-2 text-muted">生成真实性分析报告，识别 Deepfake 痕迹</p>
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )}
-                                </div>
-                            )}
-
-                            {/* 状态 3: 处理中 Loading */}
-                            {(status === 'UPLOADING' || status === 'PROCESSING') && (
-                                <div className="text-center py-5">
-                                    <div className="spinner-border text-primary" role="status" style={{ width: '3rem', height: '3rem' }}></div>
-                                    <p className="mt-3 text-muted fs-5">
-                                        {status === 'UPLOADING' ? '正在加密传输...' : 'AI 引擎正在计算 (模拟 C++ 核心)...'}
-                                    </p>
-                                </div>
-                            )}
-
-                            {/* 状态 4: 待支付 (展示预览图) */}
-                            {status === 'READY_PAY' && (
-                                <div className="text-center animate__animated animate__fadeIn">
-                                    <h3 className="mb-3 text-success">
-                                        <FaCheckCircle className="me-2" />处理完成！
-                                    </h3>
-
-                                    {previewUrl && (
-                                        <div className="mb-4 bg-light p-3 rounded">
-                                            <p className="text-muted small mb-2">处理结果预览 (低清/带水印)</p>
-                                            <img src={previewUrl} alt="Preview" className="img-fluid rounded shadow-sm" style={{ maxHeight: '300px' }} />
-                                        </div>
-                                    )}
-
-                                    <div className="bg-light p-4 rounded mb-4 border">
-                                        <div className="d-flex justify-content-between align-items-center">
-                                            <span>服务项目：</span>
-                                            <strong>专业版图像防护</strong>
-                                        </div>
-                                        <hr />
-                                        <div className="d-flex justify-content-between align-items-center">
-                                            <span className="fs-5">支付金额：</span>
-                                            <span className="text-danger fw-bold fs-3">¥ 5.00</span>
-                                        </div>
-                                        <p className="small text-muted mt-2 mb-0">支付后即可下载全尺寸、无损结果文件</p>
+                                        
+                                        <p className="small text-muted mt-3 mb-0 border-top pt-2">
+                                            <strong>付费权益：</strong> 下载无损、无水印的完整文件及详细 PDF 报告。
+                                        </p>
                                     </div>
-
-                                    <button onClick={handlePayment} className="btn btn-success btn-lg w-100 py-3 fw-bold">
-                                        立即支付 (支付宝)
-                                    </button>
-                                    <button onClick={resetFlow} className="btn btn-link text-muted mt-3">
-                                        放弃并重新开始
-                                    </button>
                                 </div>
-                            )}
 
-                            {/* 状态 5: 支付成功 / 可下载 */}
-                            {status === 'PAID' && (
-                                <div className="text-center py-5 animate__animated animate__fadeIn">
-                                    <div className="mb-4 text-success">
-                                        <FaShieldAlt size={80} />
-                                    </div>
-                                    <h2 className="fw-bold mb-3">支付成功！</h2>
-                                    <p className="text-muted mb-4">您的文件已准备就绪，系统将为您保留 24 小时。</p>
+                                <button onClick={handlePayment} className="btn btn-success btn-lg w-100 py-3 fw-bold shadow-sm">
+                                    立即支付 ¥5.00 获取完整结果
+                                </button>
+                                <button onClick={resetFlow} className="btn btn-link text-muted w-100 mt-2 text-decoration-none">放弃并重新开始</button>
+                            </div>
+                        )}
 
-                                    <button onClick={handleDownload} className="btn btn-primary btn-lg w-100 py-3 mb-3 fw-bold shadow">
-                                        <FaDownload className="me-2" /> 下载结果文件
-                                    </button>
-
-                                    <button onClick={resetFlow} className="btn btn-outline-secondary w-100">
-                                        处理下一张图片
-                                    </button>
-                                </div>
-                            )}
-
-                        </div>
+                        {/* 4. Success */}
+                        {status === 'PAID' && (
+                            <div className="text-center py-5">
+                                <FaShieldAlt className="text-success mb-3" size={80}/>
+                                <h2 className="fw-bold">支付成功</h2>
+                                <p className="text-muted mb-4">您的文件已准备就绪。</p>
+                                <button onClick={() => window.open(`${API_BASE}/download/${fileId}`)} className="btn btn-primary btn-lg px-5 shadow">
+                                    <FaDownload className="me-2"/>下载文件
+                                </button>
+                            </div>
+                        )}
                     </div>
                 </div>
             </div>
-
-            {/* 底部 Footer */}
-            <footer className="text-center py-4 text-muted small bg-white border-top">
-                <div className="mb-2">© 2024 Image Sentinel. 图像卫士技术有限公司提供支持.</div>
-                <div>
-                    备案号：
-                    <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer" className="text-muted text-decoration-none ms-2">
-                        蜀ICP备2024114874号-1
-                    </a>
-                </div>
-            </footer>
         </div>
     );
 }

@@ -6,18 +6,14 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const db = require('./database');
-const axios = require('axios'); // [新增] 用于调用 C++ 服务
-
-// 引入支付宝 SDK
+const axios = require('axios');
 const { AlipaySdk } = require('alipay-sdk');
 
 const app = express();
 const PORT = 8080;
-
-// [新增] C++ 核心微服务地址 (内网环回地址，速度快且安全)
 const CPP_SERVICE_URL = 'http://127.0.0.1:9000';
 
-// --- 支付宝初始化 ---
+// --- 支付宝 SDK 初始化 ---
 const alipaySdk = new AlipaySdk({
     appId: process.env.ALIPAY_APP_ID,
     privateKey: process.env.ALIPAY_PRIVATE_KEY,
@@ -32,99 +28,115 @@ const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const OUTPUT_DIR = path.join(__dirname, 'output');
 const CLIENT_DIST_DIR = path.join(__dirname, 'client/dist');
 
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+// 确保目录存在
+[UPLOAD_DIR, OUTPUT_DIR].forEach(dir => {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
 
 // --- 中间件 ---
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-    filename: (req, file, cb) => {
-        const ext = path.extname(file.originalname);
-        cb(null, `${uuidv4()}${ext}`);
-    }
-});
 const upload = multer({
-    storage,
-    limits: { fileSize: 20 * 1024 * 1024 }
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+        filename: (req, file, cb) => {
+            const ext = path.extname(file.originalname);
+            cb(null, `${uuidv4()}${ext}`);
+        }
+    }),
+    limits: { fileSize: 50 * 1024 * 1024 } // 50MB 限制
 });
 
 // --- API 接口 ---
 
-// 1. 上传
+// 1. 上传文件
 app.post('/api/upload', upload.single('image'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: '请选择文件' });
+    
     const fileId = path.parse(req.file.filename).name;
+    
     try {
+        // 插入初始记录
         db.prepare(`
             INSERT INTO files (id, originalName, storedName, uploadPath, size, mimeType, createdAt)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         `).run(fileId, req.file.originalname, req.file.filename, req.file.path, req.file.size, req.file.mimetype, new Date().toISOString());
+        
         res.json({ success: true, fileId });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Database error' });
+        console.error('DB Error:', err);
+        res.status(500).json({ error: 'Database initialization failed' });
     }
 });
 
-// 2. 处理 (已修改：调用真实 C++ 微服务)
+// 2. 核心处理 (调用 C++)
 app.post('/api/process', async (req, res) => {
     const { fileId, algorithm } = req.body;
-
-    // 1. 从数据库获取文件信息
+    
+    // 1. 获取文件记录
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
     if (!file) return res.status(404).json({ error: '文件不存在' });
 
-    // 2. 定义输出文件名和路径
-    // 注意：确保后缀名与 C++ 输出一致 (通常是 .png 或保持原格式)
+    // 2. 准备输出路径
     const processedFilename = `processed_${fileId}_${algorithm}.png`;
     const outputPath = path.join(OUTPUT_DIR, processedFilename);
+    // 生成一个用于嵌入的模拟 ID (生产环境应来自用户账户)
+    const watermarkData = `USER-${fileId.substring(0, 6).toUpperCase()}`;
 
     try {
-        console.log(`[Node] Calling C++ Service for ${fileId} using ${algorithm}...`);
+        console.log(`[Node] Calling C++ Service for ${algorithm}...`);
 
-        // 3. 发起 HTTP 请求给 C++ 服务
-        // 关键点：必须使用 path.resolve 将路径转换为绝对路径，因为 C++ 服务不知道 Node 的相对路径上下文
+        // 3. 调用 C++ 微服务
         const cppResponse = await axios.post(`${CPP_SERVICE_URL}/process`, {
             inputPath: path.resolve(file.uploadPath),
             outputPath: path.resolve(outputPath),
-            algorithm: algorithm
+            algorithm: algorithm,
+            watermarkData: watermarkData
         });
 
-        // 4. 检查 C++ 服务返回的结果
+        // 4. 处理 C++ 响应
         if (cppResponse.data.success) {
-            // C++ 处理成功，更新数据库
-            db.prepare('UPDATE files SET processedName = ?, outputPath = ? WHERE id = ?')
-                .run(processedFilename, outputPath, fileId);
+            // [关键] 提取 C++ 返回的业务数据 (score, extractedId, riskLevel 等)
+            // 这里的 ...evidenceData 是 ES6 剩余参数语法，表示"除了success之外的所有字段"
+            const { success, ...evidenceData } = cppResponse.data;
 
-            // 返回预览 URL
-            res.json({ success: true, previewUrl: `/api/preview/${fileId}` });
+            // 将证据数据序列化存入数据库 (确保 database.js 中已创建 algorithmResult 列)
+            // 如果您的 DB 尚未更新结构，请先在 DB 中执行: ALTER TABLE files ADD COLUMN algorithmResult TEXT;
+            const evidenceJson = JSON.stringify(evidenceData);
+
+            db.prepare(`
+                UPDATE files 
+                SET processedName = ?, outputPath = ?, algorithmResult = ? 
+                WHERE id = ?
+            `).run(processedFilename, outputPath, evidenceJson, fileId);
+
+            // 将所有证据数据返回给前端，用于渲染"证据卡片"
+            res.json({ 
+                success: true, 
+                previewUrl: `/api/preview/${fileId}`,
+                ...evidenceData 
+            });
         } else {
-            // C++ 服务逻辑报错 (如 OpenCV 读取失败)
-            throw new Error(cppResponse.data.error || 'Unknown C++ Service Error');
+            throw new Error(cppResponse.data.error || 'Algorithm computation failed');
         }
 
     } catch (err) {
         console.error('Processing Error:', err.message);
-
-        // 区分错误类型
         if (err.code === 'ECONNREFUSED') {
-            return res.status(503).json({ error: '核心算法服务未启动，请联系管理员' });
+            return res.status(503).json({ error: 'AI 核心引擎未启动 (Port 9000 Unreachable)' });
         }
-
-        res.status(500).json({
-            error: '图像处理失败: ' + (err.response?.data?.error || err.message)
-        });
+        res.status(500).json({ error: 'Processing failed: ' + (err.response?.data?.error || err.message) });
     }
 });
 
-// 3. 预览
+// 3. 预览图片
 app.get('/api/preview/:id', (req, res) => {
     const file = db.prepare('SELECT outputPath FROM files WHERE id = ?').get(req.params.id);
-    if (!file || !file.outputPath) return res.status(404).send('Not found');
+    if (!file || !file.outputPath || !fs.existsSync(file.outputPath)) {
+        return res.status(404).send('Preview image not found');
+    }
     res.sendFile(file.outputPath);
 });
 
@@ -132,64 +144,59 @@ app.get('/api/preview/:id', (req, res) => {
 app.post('/api/pay', async (req, res) => {
     const { fileId } = req.body;
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
-    if (!file) return res.status(404).json({ error: '文件不存在' });
+    if (!file) return res.status(404).json({ error: 'File not found' });
 
     const outTradeNo = `${fileId}_${Date.now()}`;
+    // 定价策略：提升价格以显示专业度
+    const amount = '5.00'; 
 
     try {
-        // 使用 pageExec 生成支付表单 HTML
         const result = await alipaySdk.pageExec('alipay.trade.page.pay', {
             method: 'POST',
             bizContent: {
                 out_trade_no: outTradeNo,
                 product_code: 'FAST_INSTANT_TRADE_PAY',
-                total_amount: '0.10',
-                subject: 'Image Sentinel Service',
-                body: `File ID: ${fileId}`,
+                total_amount: amount,
+                subject: 'Image Sentinel Pro Analysis',
+                body: `File: ${file.originalName}`,
             },
             returnUrl: `${process.env.SERVER_HOST}/?status=paid&fileId=${fileId}`,
             notifyUrl: `${process.env.SERVER_HOST}/api/payment/notify`,
         });
 
         res.json({ success: true, formHtml: result });
-
     } catch (err) {
         console.error('Alipay Error:', err);
-        res.status(500).json({ error: '支付发起失败: ' + err.message });
+        res.status(500).json({ error: 'Payment initialization failed' });
     }
 });
 
-// 5. 支付宝异步通知
+// 5. 支付宝回调
 app.post('/api/payment/notify', (req, res) => {
     const params = req.body;
-    console.log('Received Alipay Notify:', params);
-
-    // 验签
     const checkResult = alipaySdk.checkNotifySign(params);
 
     if (checkResult) {
-        const outTradeNo = params.out_trade_no;
-        const tradeStatus = params.trade_status;
-
-        if (tradeStatus === 'TRADE_SUCCESS' || tradeStatus === 'TRADE_FINISHED') {
-            const fileId = outTradeNo.split('_')[0];
+        if (['TRADE_SUCCESS', 'TRADE_FINISHED'].includes(params.trade_status)) {
+            const fileId = params.out_trade_no.split('_')[0];
             db.prepare('UPDATE files SET isPaid = 1 WHERE id = ?').run(fileId);
         }
         res.send('success');
     } else {
-        console.error('Alipay Verify Failed');
         res.send('fail');
     }
 });
 
-// 6. 下载
+// 6. 最终下载
 app.get('/api/download/:id', (req, res) => {
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id);
-    if (!file) return res.status(404).send('文件不存在');
-    if (file.isPaid !== 1) return res.status(403).send('请先支付费用');
+    if (!file) return res.status(404).send('File not found');
+    
+    // 权限校验
+    if (file.isPaid !== 1) return res.status(403).send('Payment required to download full resolution report');
 
-    // 下载时使用原始文件名加前缀
-    res.download(file.outputPath, `Sentinel_${file.originalName}`);
+    // 下载处理后的文件
+    res.download(file.outputPath, `Sentinel_Protected_${file.originalName}`);
 });
 
 // 前端托管
@@ -197,7 +204,7 @@ app.use(express.static(CLIENT_DIST_DIR));
 app.get('*', (req, res) => {
     const indexHtml = path.join(CLIENT_DIST_DIR, 'index.html');
     if (fs.existsSync(indexHtml)) res.sendFile(indexHtml);
-    else res.send('Frontend building...');
+    else res.send('Frontend is building...');
 });
 
 app.listen(PORT, () => {
