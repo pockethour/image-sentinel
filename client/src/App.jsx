@@ -4,16 +4,20 @@ import axios from 'axios';
 import {
     FaShieldAlt, FaCloudUploadAlt, FaMagic, FaDownload, FaLock,
     FaCheckCircle, FaExclamationTriangle, FaFingerprint, FaKey,
-    FaSearch, FaDollarSign, FaTimesCircle, FaCheck, FaTimes
+    FaSearch, FaDollarSign, FaTimesCircle, FaCheck
 } from 'react-icons/fa';
 
 const API_BASE = '/api';
 const MAX_WATERMARK_LENGTH = 32;
 
+// [安全配置] 文件名非法字符正则
+// 包含: < > : " / \ | ? * 以及 ASCII 控制字符 (0-31)
+const INVALID_FILENAME_CHARS = /[<>:"/\\|?*\x00-\x1F]/;
+
 function App() {
     const [fileId, setFileId] = useState(null);
-    const [mode, setMode] = useState('EMBED'); // 'EMBED' (付费) 或 'VERIFY' (免费)
-    // IDLE, UPLOADING, UPLOADED, PROCESSING, READY_PAY, PAID, VERIFYING, VERIFIED, QUICK_VERIFYING
+    const [mode, setMode] = useState('EMBED'); // EMBED or VERIFY
+    // 状态机: IDLE, UPLOADING, UPLOADED, PROCESSING, READY_PAY, PAID, VERIFYING, VERIFIED, QUICK_VERIFYING
     const [status, setStatus] = useState('IDLE');
 
     const [previewUrl, setPreviewUrl] = useState(null);
@@ -21,82 +25,81 @@ function App() {
     const [evidence, setEvidence] = useState(null);
     const [error, setError] = useState('');
 
-    // --- 定制化和查询结果状态 ---
     const [customWatermarkText, setCustomWatermarkText] = useState('');
     const [verifyResult, setVerifyResult] = useState(null);
-
-    // [新增状态] 快速验证的结果，包含 type, message, extractedText
     const [quickVerifyResult, setQuickVerifyResult] = useState(null);
-    // ----------------------------
+    const [hasDownloaded, setHasDownloaded] = useState(false);
+
+    // [交互] 输入框非法字符拦截提示
+    const [inputWarning, setInputWarning] = useState('');
 
     useEffect(() => {
-        // 支付成功回调处理
         const query = new URLSearchParams(window.location.search);
         if (query.get('status') === 'paid' && query.get('fileId')) {
             setFileId(query.get('fileId'));
             setStatus('PAID');
             setMode('EMBED');
+            setHasDownloaded(false);
+            // 清理 URL 参数
             window.history.replaceState({}, '', '/');
         }
     }, []);
 
-    // =========================================================================
-    // [核心逻辑] 防止误操作导致付费流程丢失
-    // =========================================================================
-
-    // 1. 监听浏览器关闭/刷新事件
+    // --- 防误触逻辑 ---
     useEffect(() => {
         const handleBeforeUnload = (e) => {
-            // 只有在 "付费模式" (EMBED) 且状态为 "待支付" (READY_PAY) 时才拦截
-            if (mode === 'EMBED' && status === 'READY_PAY') {
+            const isPendingPayment = mode === 'EMBED' && status === 'READY_PAY';
+            const isPaidButNotDownloaded = status === 'PAID' && !hasDownloaded;
+            if (isPendingPayment || isPaidButNotDownloaded) {
                 e.preventDefault();
-                e.returnValue = ''; // Chrome 需要此属性来触发弹窗
+                e.returnValue = '';
             }
         };
-
         window.addEventListener('beforeunload', handleBeforeUnload);
         return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-    }, [mode, status]);
+    }, [mode, status, hasDownloaded]);
 
-    // 2. 内部导航拦截检查函数
     const confirmExit = () => {
         if (mode === 'EMBED' && status === 'READY_PAY') {
             return window.confirm("⚠️ 警告：当前订单尚未支付。\n\n离开此页面将丢失已处理的预览图和嵌入数据。\n确定要放弃本次交易吗？");
         }
+        if (status === 'PAID' && !hasDownloaded) {
+            return window.confirm("🛑 警告：您尚未下载付费文件！\n\n一旦离开此页面，您可能无法再次找回该文件。\n\n确定要放弃下载并离开吗？");
+        }
         return true;
     };
 
-    // 3. 安全的模式切换函数
     const handleModeSwitch = (targetMode) => {
-        if (mode === targetMode) return; // 点击当前模式不做反应
-
+        if (mode === targetMode) return;
         if (confirmExit()) {
             resetFlow();
             setMode(targetMode);
         }
     };
 
-    // 4. 安全的重置/放弃函数
     const handleReset = () => {
         if (confirmExit()) {
             resetFlow();
         }
     };
-    // =========================================================================
 
+    const handleDownloadClick = () => {
+        window.open(`${API_BASE}/download/${fileId}`);
+        setHasDownloaded(true);
+    };
+
+    // --- 业务逻辑 ---
 
     const handleFileChange = async (e) => {
-        // 如果在待支付状态下上传新文件，也需要确认
         if (!confirmExit()) {
-            e.target.value = null; // 清空 input 防止重复触发
+            e.target.value = null;
             return;
         }
-
         const file = e.target.files[0];
         if (!file) return;
+
         const formData = new FormData();
         formData.append('image', file);
-
         setStatus('UPLOADING');
         setError('');
 
@@ -109,6 +112,7 @@ function App() {
                 setStatus('UPLOADED');
                 setVerifyResult(null);
                 setQuickVerifyResult(null);
+                setHasDownloaded(false);
             }
         } catch (err) {
             setError('上传失败');
@@ -116,9 +120,34 @@ function App() {
         }
     };
 
+    // [核心修改] 处理水印输入：拦截非法字符
+    const handleWatermarkInput = (e) => {
+        const val = e.target.value;
+
+        // 1. 检查是否包含非法字符
+        if (INVALID_FILENAME_CHARS.test(val)) {
+            setInputWarning('不能包含特殊字符 (\\ / : * ? " < > |) 以便用于文件名');
+
+            // 3秒后自动清除警告
+            setTimeout(() => setInputWarning(''), 3000);
+
+            // [关键] 直接返回，不更新 state，这样非法字符根本不会显示在输入框里
+            return;
+        }
+
+        // 2. 检查长度
+        if (val.length > MAX_WATERMARK_LENGTH) {
+            // 虽然 input maxLength 属性已限制，但双重保险
+            return;
+        }
+
+        // 验证通过，更新输入框
+        setInputWarning('');
+        setCustomWatermarkText(val);
+    };
+
     const startProcessingOrVerifying = async (algo) => {
         setError('');
-
         if (mode === 'EMBED') {
             setStatus('PROCESSING');
             setAlgorithm(algo);
@@ -128,7 +157,6 @@ function App() {
                     algorithm: algo,
                     customWatermarkText: customWatermarkText.trim()
                 });
-
                 if (res.data.success) {
                     setPreviewUrl(res.data.previewUrl);
                     const { success, previewUrl, ...rest } = res.data;
@@ -142,18 +170,11 @@ function App() {
         } else if (mode === 'VERIFY') {
             setStatus('VERIFYING');
             try {
-                const res = await axios.post(`${API_BASE}/verify_watermark_free`, {
-                    fileId
-                });
-
-                // 免费查询模式下，直接处理 verifyResult
-                // 这里的逻辑可以复用下面的 found/not found 逻辑，也可以保持原样
-                // 为了简单起见，这里直接存结果，渲染逻辑在 JSX 里处理
+                const res = await axios.post(`${API_BASE}/verify_watermark_free`, { fileId });
                 setVerifyResult(res.data);
                 setStatus('VERIFIED');
             } catch (err) {
                 setVerifyResult(null);
-                // 如果是 500 系统错误才显示报错
                 setError(err.response?.data?.error || '查询失败');
                 setStatus('UPLOADED');
             }
@@ -172,44 +193,33 @@ function App() {
         }
     };
 
-    // [核心修改] 交互式快速验证功能 (优化了状态提示)
     const startQuickVerification = async () => {
         setStatus('QUICK_VERIFYING');
         setQuickVerifyResult(null);
-
         try {
-            const res = await axios.post(`${API_BASE}/verify_watermark_free`, {
-                fileId
-            });
-
+            const res = await axios.post(`${API_BASE}/verify_watermark_free`, { fileId });
             if (res.data.found) {
-                // 情况 1: 找到了水印 (绿色成功提示)
                 setQuickVerifyResult({
                     type: 'success',
                     message: `验证成功！提取信息：${res.data.extractedText}`,
                     extractedText: res.data.extractedText
                 });
             } else {
-                // 情况 2: 没找到水印 (黄色警告提示，而不是错误)
                 setQuickVerifyResult({
                     type: 'warning',
                     message: '未检测到数字水印。该图片可能未经过保护或水印已被破坏。'
                 });
             }
-
         } catch (err) {
-            // 情况 3: 系统错误 (红色错误提示)
             setQuickVerifyResult({
                 type: 'error',
                 message: err.response?.data?.error || '服务器连接失败，请稍后重试。'
             });
         } finally {
             setStatus('READY_PAY');
-            // 8秒后自动清除提示
             setTimeout(() => setQuickVerifyResult(null), 8000);
         }
     };
-
 
     const resetFlow = () => {
         setStatus('IDLE');
@@ -218,49 +228,38 @@ function App() {
         setEvidence(null);
         setError('');
         setCustomWatermarkText('');
+        setInputWarning('');
         setVerifyResult(null);
         setQuickVerifyResult(null);
+        setHasDownloaded(false);
     };
 
     const getStepTitle = () => {
         if (status === 'IDLE') return mode === 'EMBED' ? '步骤 1: 上传图片并定制水印' : '步骤 1: 上传带水印图片';
         if (status === 'UPLOADED') return mode === 'EMBED' ? '步骤 2: 选择处理算法' : '步骤 2: 开始免费查询';
         return '处理中...';
-    }
-
+    };
 
     return (
         <div className="min-vh-100 bg-light font-sans-serif">
-            {/* 顶部的 Toast/弹窗提示 (优化样式支持 success/warning/error) */}
+            {/* Toast 提示 */}
             {quickVerifyResult && (
-                <div
-                    className={`alert ${quickVerifyResult.type === 'success' ? 'alert-success' :
-                            quickVerifyResult.type === 'warning' ? 'alert-warning' : 'alert-danger'
-                        } animate__animated animate__fadeInDown position-fixed top-0 start-50 translate-middle-x mt-3 shadow`}
-                    style={{ zIndex: 1000, minWidth: '450px' }}
-                    role="alert"
-                >
+                <div className={`alert ${quickVerifyResult.type === 'success' ? 'alert-success' : quickVerifyResult.type === 'warning' ? 'alert-warning' : 'alert-danger'} animate__animated animate__fadeInDown position-fixed top-0 start-50 translate-middle-x mt-3 shadow`} style={{ zIndex: 1000, minWidth: '450px' }} role="alert">
                     <h5 className="alert-heading d-flex align-items-center">
                         {quickVerifyResult.type === 'success' && <FaCheckCircle className="me-2" />}
                         {quickVerifyResult.type === 'warning' && <FaExclamationTriangle className="me-2" />}
                         {quickVerifyResult.type === 'error' && <FaTimesCircle className="me-2" />}
-
-                        {quickVerifyResult.type === 'success' ? '验证成功' :
-                            quickVerifyResult.type === 'warning' ? '结果提示' : '验证错误'}
+                        {quickVerifyResult.type === 'success' ? '验证成功' : quickVerifyResult.type === 'warning' ? '结果提示' : '验证错误'}
                     </h5>
                     <p className="mb-0">{quickVerifyResult.message}</p>
                     {quickVerifyResult.extractedText && (
-                        <p className="mt-2 mb-0 small font-monospace bg-white bg-opacity-50 p-2 rounded text-break">
-                            {quickVerifyResult.extractedText}
-                        </p>
+                        <p className="mt-2 mb-0 small font-monospace bg-white bg-opacity-50 p-2 rounded text-break">{quickVerifyResult.extractedText}</p>
                     )}
                 </div>
             )}
 
-            {/* Header */}
             <div className="bg-dark text-white text-center py-5 mb-4">
-                {/* 点击 Logo 也视为重置操作，需要拦截 */}
-                <h1 className="fw-bold cursor-pointer" onClick={handleReset} style={{ cursor: 'pointer' }}>
+                <h1 className="fw-bold" onClick={handleReset} style={{ cursor: 'pointer' }}>
                     <FaShieldAlt className="text-warning me-2" />图像卫士 Sentinel
                 </h1>
                 <p className="opacity-75">企业级隐形水印 & AI 取证平台</p>
@@ -271,43 +270,33 @@ function App() {
 
                 <div className="card shadow-lg border-0">
                     <div className="card-body p-5">
-
-                        {/* 模式切换按钮 (修改了 onClick 处理逻辑) */}
                         <div className="d-flex justify-content-center mb-4 p-3 bg-light rounded">
-                            <button
-                                onClick={() => handleModeSwitch('EMBED')}
-                                className={`btn btn-lg fw-bold me-3 ${mode === 'EMBED' ? 'btn-primary' : 'btn-outline-primary'}`}
-                            >
+                            <button onClick={() => handleModeSwitch('EMBED')} className={`btn btn-lg fw-bold me-3 ${mode === 'EMBED' ? 'btn-primary' : 'btn-outline-primary'}`}>
                                 <FaDollarSign className="me-2" />付费嵌入水印
                             </button>
-                            <button
-                                onClick={() => handleModeSwitch('VERIFY')}
-                                className={`btn btn-lg fw-bold ${mode === 'VERIFY' ? 'btn-info' : 'btn-outline-info'}`}
-                            >
+                            <button onClick={() => handleModeSwitch('VERIFY')} className={`btn btn-lg fw-bold ${mode === 'VERIFY' ? 'btn-info' : 'btn-outline-info'}`}>
                                 <FaSearch className="me-2" />免费查询水印
                             </button>
                         </div>
 
                         <h4 className="fw-bold mb-3">{getStepTitle()}</h4>
 
-
-                        {/* 1. Watermark Custom Input */}
                         {mode === 'EMBED' && status !== 'READY_PAY' && status !== 'PAID' && (
                             <div className="mb-4">
                                 <h5 className="text-start mb-2"><FaKey className="me-2 text-primary" />自定义水印内容 (Max {MAX_WATERMARK_LENGTH}字)</h5>
                                 <input
                                     type="text"
-                                    className="form-control form-control-lg"
-                                    placeholder="例如：版权属于张三，订单号：#20251213"
+                                    className={`form-control form-control-lg ${inputWarning ? 'is-invalid' : ''}`}
+                                    placeholder="例如：版权属于张三 (将作为下载文件名的一部分)"
                                     maxLength={MAX_WATERMARK_LENGTH}
                                     value={customWatermarkText}
-                                    onChange={(e) => setCustomWatermarkText(e.target.value)}
+                                    onChange={handleWatermarkInput}
                                 />
+                                {inputWarning && <div className="invalid-feedback animate__animated animate__shakeX">{inputWarning}</div>}
                                 <div className="text-muted small mt-1 text-end">剩余 {MAX_WATERMARK_LENGTH - customWatermarkText.length} 字</div>
                             </div>
                         )}
 
-                        {/* 2. Upload Area */}
                         {(status === 'IDLE' || status === 'UPLOADED') && status !== 'READY_PAY' && status !== 'PAID' && (
                             <div className="text-center">
                                 <label className="d-block w-100 p-5 border border-2 border-dashed rounded cursor-pointer bg-white position-relative">
@@ -330,15 +319,15 @@ function App() {
                                 {status === 'UPLOADED' && mode === 'EMBED' && (
                                     <div className="row g-3 mt-4">
                                         <div className="col-md-6">
-                                            <button onClick={() => startProcessingOrVerifying('watermark')} className="btn btn-outline-primary w-100 p-4 h-100 border-2 text-start" disabled={!customWatermarkText.trim()}>
+                                            <button onClick={() => startProcessingOrVerifying('watermark')} className="btn btn-outline-primary w-100 p-4 h-100 border-2 text-start" disabled={!customWatermarkText.trim() || !!inputWarning}>
                                                 <h5 className="fw-bold"><FaLock className="me-2" />隐形水印 (嵌入)</h5>
-                                                <small className="text-muted d-block mt-2">嵌入定制信息。¥5.00</small>
+                                                <small className="text-muted d-block mt-2">嵌入定制信息。¥4.99</small>
                                             </button>
                                         </div>
                                         <div className="col-md-6">
                                             <button onClick={() => startProcessingOrVerifying('forensics')} className="btn btn-outline-danger w-100 p-4 h-100 border-2 text-start">
                                                 <h5 className="fw-bold"><FaMagic className="me-2" />防篡改取证</h5>
-                                                <small className="text-muted d-block mt-2">ELA 热力图分析。¥5.00</small>
+                                                <small className="text-muted d-block mt-2">ELA 热力图分析。¥4.99</small>
                                             </button>
                                         </div>
                                     </div>
@@ -352,7 +341,6 @@ function App() {
                             </div>
                         )}
 
-                        {/* 3. Processing */}
                         {(status === 'UPLOADING' || status === 'PROCESSING' || status === 'VERIFYING' || status === 'QUICK_VERIFYING') && (
                             <div className="text-center py-5">
                                 <div className="spinner-border text-primary mb-3" style={{ width: '3rem', height: '3rem' }}></div>
@@ -360,22 +348,17 @@ function App() {
                             </div>
                         )}
 
-                        {/* 4. VERIFIED Result (免费查询结果展示 - 也适配了新的 found 逻辑) */}
                         {status === 'VERIFIED' && verifyResult && mode === 'VERIFY' && (
                             <div className="animate__animated animate__fadeIn">
                                 <h3 className="fw-bold mb-4"><FaSearch className="me-2 text-info" />查询结果</h3>
-
-                                {/* 适配后端新格式 (found: true/false) 或旧格式 (extractedText 判断) */}
                                 {(() => {
                                     const isFound = verifyResult.found !== undefined ? verifyResult.found : !!verifyResult.extractedText;
-
                                     return (
                                         <div className={`alert ${isFound ? 'alert-success' : 'alert-warning'} border-0`}>
                                             <h5 className="fw-bold">
                                                 {isFound ? (<><FaCheckCircle className="me-2" />水印验证成功！</>)
                                                     : (<><FaExclamationTriangle className="me-2" />结果提示</>)}
                                             </h5>
-
                                             {isFound ? (
                                                 <div className="mt-3">
                                                     <strong className="text-primary d-block mb-1">提取到的定制信息:</strong>
@@ -383,34 +366,25 @@ function App() {
                                                     <small className="text-muted">置信度: {verifyResult.confidenceScore ? verifyResult.confidenceScore.toFixed(2) : 'N/A'}</small>
                                                 </div>
                                             ) : (
-                                                <p className="mt-2">
-                                                    {verifyResult.message || "未检测到有效数字水印。该图片可能未经过保护或水印已被破坏。"}
-                                                </p>
+                                                <p className="mt-2">{verifyResult.message || "未检测到有效数字水印。该图片可能未经过保护或水印已被破坏。"}</p>
                                             )}
                                         </div>
                                     );
                                 })()}
-
                                 <button onClick={handleReset} className="btn btn-secondary w-100 mt-3">重新查询</button>
                             </div>
                         )}
 
-
-                        {/* 5. Evidence & Pay (READY_PAY) */}
                         {status === 'READY_PAY' && evidence && mode === 'EMBED' && (
                             <div className="animate__animated animate__fadeIn">
                                 <div className="text-center mb-4">
                                     <h3 className="fw-bold text-success"><FaCheckCircle className="me-2" />分析完成</h3>
                                     <p className="text-muted">请查阅下方的分析摘要</p>
                                 </div>
-
                                 <div className="row g-0 border rounded overflow-hidden mb-4 shadow-sm">
-                                    {/* 左侧：预览图 */}
                                     <div className="col-md-6 bg-dark d-flex align-items-center justify-content-center p-3">
                                         <img src={previewUrl} className="img-fluid rounded" style={{ maxHeight: '300px' }} alt="Result" />
                                     </div>
-
-                                    {/* 右侧：证据卡片 */}
                                     <div className="col-md-6 bg-white p-4 d-flex flex-column justify-content-center">
                                         {algorithm === 'watermark' ? (
                                             <>
@@ -419,16 +393,8 @@ function App() {
                                                     <small className="fw-bold text-uppercase text-success">Embedded Data</small>
                                                     <div className="fs-5 font-monospace text-dark text-break">{evidence.embeddedText}</div>
                                                 </div>
-                                                <ul className="list-unstyled small text-muted mb-0">
-                                                    <li className="mb-1">✅ 算法: {evidence.algorithm}</li>
-                                                </ul>
-
-                                                {/* 快速验证按钮 */}
-                                                <button
-                                                    onClick={startQuickVerification}
-                                                    className="btn btn-sm btn-outline-info mt-3"
-                                                    disabled={status === 'QUICK_VERIFYING'}
-                                                >
+                                                {/* 算法信息已移除 */}
+                                                <button onClick={startQuickVerification} className="btn btn-sm btn-outline-info mt-3" disabled={status === 'QUICK_VERIFYING'}>
                                                     {status === 'QUICK_VERIFYING' ? '验证中...' : '点击快速验证水印 (免费)'}
                                                 </button>
                                             </>
@@ -436,9 +402,7 @@ function App() {
                                             <>
                                                 <h5 className="text-danger fw-bold mb-3"><FaExclamationTriangle className="me-2" />真实性分析</h5>
                                                 <div className="d-flex align-items-end mb-3">
-                                                    <span className={`display-4 fw-bold lh-1 me-2 ${evidence.score < 60 ? 'text-danger' : 'text-success'}`}>
-                                                        {evidence.score}
-                                                    </span>
+                                                    <span className={`display-4 fw-bold lh-1 me-2 ${evidence.score < 60 ? 'text-danger' : 'text-success'}`}>{evidence.score}</span>
                                                     <span className="text-muted mb-2">/ 100 分</span>
                                                 </div>
                                                 <ul className="list-unstyled small text-muted mb-0">
@@ -447,33 +411,24 @@ function App() {
                                                 </ul>
                                             </>
                                         )}
-
-                                        <p className="small text-muted mt-3 mb-0 border-top pt-2">
-                                            <strong>付费权益：</strong> 下载无损、无可见水印的完整文件及详细报告。
-                                        </p>
+                                        <p className="small text-muted mt-3 mb-0 border-top pt-2"><strong>付费权益：</strong> 下载无损、无可见水印的完整文件。</p>
                                     </div>
                                 </div>
-
-                                <button onClick={handlePayment} className="btn btn-success btn-lg w-100 py-3 fw-bold shadow-sm">
-                                    立即支付 ¥5.00 获取完整结果
-                                </button>
-                                {/* 修改了这里的按钮调用，使用 handleReset */}
-                                <button onClick={handleReset} className="btn btn-link text-muted w-100 mt-2 text-decoration-none">
-                                    放弃并重新开始
-                                </button>
+                                <button onClick={handlePayment} className="btn btn-success btn-lg w-100 py-3 fw-bold shadow-sm">立即支付 ¥4.99 获取完整结果</button>
+                                <button onClick={handleReset} className="btn btn-link text-muted w-100 mt-2 text-decoration-none">放弃并重新开始</button>
                             </div>
                         )}
 
-                        {/* 6. Success (PAID) */}
                         {status === 'PAID' && mode === 'EMBED' && (
-                            <div className="text-center py-5">
+                            <div className="text-center py-5 animate__animated animate__zoomIn">
                                 <FaShieldAlt className="text-success mb-3" size={80} />
                                 <h2 className="fw-bold">支付成功</h2>
-                                <p className="text-muted mb-4">您的文件已准备就绪。</p>
-                                <button onClick={() => window.open(`${API_BASE}/download/${fileId}`)} className="btn btn-primary btn-lg px-5 shadow">
+                                <p className="text-muted mb-4">您的文件已准备就绪，请务必在离开前下载。</p>
+                                <button onClick={handleDownloadClick} className="btn btn-primary btn-lg px-5 shadow mb-3">
                                     <FaDownload className="me-2" />下载文件
                                 </button>
-                                <button onClick={handleReset} className="btn btn-link text-muted w-100 mt-2 text-decoration-none">返回主页</button>
+                                {hasDownloaded && <div className="text-success small mb-3 animate__animated animate__fadeIn"><FaCheck className="me-1" /> 已下载</div>}
+                                <div><button onClick={handleReset} className="btn btn-link text-muted w-100 text-decoration-none">返回主页</button></div>
                             </div>
                         )}
                     </div>

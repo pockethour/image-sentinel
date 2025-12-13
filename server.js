@@ -8,13 +8,13 @@ const { v4: uuidv4 } = require('uuid');
 const db = require('./database');
 const axios = require('axios');
 const { AlipaySdk } = require('alipay-sdk');
+const cron = require('node-cron');
 
 const app = express();
 const PORT = 8080;
 const CPP_SERVICE_URL = 'http://127.0.0.1:9000';
 
 // --- 支付宝 SDK 初始化 ---
-// 警告: 必须确保 .env 文件包含 ALIPAY_APP_ID 等密钥
 const alipaySdk = new AlipaySdk({
     appId: process.env.ALIPAY_APP_ID,
     privateKey: process.env.ALIPAY_PRIVATE_KEY,
@@ -34,6 +34,38 @@ const CLIENT_DIST_DIR = path.join(__dirname, 'client/dist');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
+// --- 定时清理任务 (每天凌晨 03:00 执行) ---
+cron.schedule('0 3 * * *', () => {
+    console.log('[Cron] 开始执行每日清理任务...');
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    const oldFiles = db.prepare('SELECT * FROM files WHERE createdAt < ?').all(oneDayAgo.toISOString());
+
+    if (oldFiles.length === 0) {
+        console.log('[Cron] 没有过期文件需要清理。');
+        return;
+    }
+
+    let deletedCount = 0;
+    oldFiles.forEach(file => {
+        if (file.uploadPath && fs.existsSync(file.uploadPath)) {
+            try { fs.unlinkSync(file.uploadPath); } catch (e) { console.error(`Failed to delete source: ${e.message}`); }
+        }
+        if (file.outputPath && fs.existsSync(file.outputPath)) {
+            try { fs.unlinkSync(file.outputPath); } catch (e) { console.error(`Failed to delete output: ${e.message}`); }
+        }
+        if (file.previewFilePath && fs.existsSync(file.previewFilePath)) {
+            try { fs.unlinkSync(file.previewFilePath); } catch (e) { console.error(`Failed to delete preview: ${e.message}`); }
+        }
+        deletedCount++;
+    });
+
+    const deleteStmt = db.prepare('DELETE FROM files WHERE createdAt < ?');
+    const result = deleteStmt.run(oneDayAgo.toISOString());
+
+    console.log(`[Cron] 清理完成。物理删除文件: ${deletedCount} 个，数据库清理记录: ${result.changes} 条。`);
+});
+
 // --- 中间件 ---
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
@@ -47,22 +79,41 @@ const upload = multer({
             cb(null, `${uuidv4()}${ext}`);
         }
     }),
-    limits: { fileSize: 50 * 1024 * 1024 } // 50MB 限制
+    limits: { fileSize: 50 * 1024 * 1024 }
 });
 
 // --- API 接口 ---
 
-// 1. 付费流程：原始文件上传
+// 1. 原始文件上传
 app.post('/api/upload', upload.single('image'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: '请选择文件' });
 
     const fileId = path.parse(req.file.filename).name;
 
+    // --- 【修复代码 START】 ---
+    // Multer 有时会以 Latin-1 编码读取 UTF-8 文件名，导致乱码。
+    // 这里将其转换回 Buffer，再用 utf8 读取。
+    let safeOriginalName = req.file.originalname;
+    try {
+        safeOriginalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+    } catch (e) {
+        console.warn('Filename encoding fix failed, using original:', e);
+    }
+    // --- 【修复代码 END】 ---
+
     try {
         db.prepare(`
             INSERT INTO files (id, originalName, storedName, uploadPath, size, mimeType, createdAt)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(fileId, req.file.originalname, req.file.filename, req.file.path, req.file.size, req.file.mimetype, new Date().toISOString());
+        `).run(
+            fileId,
+            safeOriginalName, // 使用修复后的名字
+            req.file.filename,
+            req.file.path,
+            req.file.size,
+            req.file.mimetype,
+            new Date().toISOString()
+        );
 
         res.json({ success: true, fileId });
     } catch (err) {
@@ -71,24 +122,50 @@ app.post('/api/upload', upload.single('image'), (req, res) => {
     }
 });
 
-// 2. 付费流程：核心处理 (调用 C++ 嵌入水印并生成预览)
+// 2. 核心处理
 app.post('/api/process', async (req, res) => {
     const { fileId, algorithm, customWatermarkText } = req.body;
+
+    // --- 安全验证 START ---
+    if (customWatermarkText) {
+        // 包含: < > : " / \ | ? * 以及 ASCII 0-31 (控制字符)
+        const INVALID_FILENAME_CHARS = /[<>:"/\\|?*\x00-\x1F]/;
+
+        if (INVALID_FILENAME_CHARS.test(customWatermarkText)) {
+            return res.status(400).json({
+                error: '水印内容包含非法字符，无法用于生成文件名 (禁止使用: < > : " / \\ | ? *)'
+            });
+        }
+        if (customWatermarkText.length > 50) {
+            return res.status(400).json({ error: '水印内容过长 (最多50字符)' });
+        }
+    }
+    // --- 安全验证 END ---
 
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
     if (!file) return res.status(404).json({ error: '文件不存在' });
 
-    const processedFilename = `watermarked_${fileId}.png`;
-    const finalOutputPath = path.join(OUTPUT_DIR, processedFilename); // 最终下载文件的路径
+    // --- 【修复方案】 ---
+    // 如果算法是 LSB，或者原图是 JPG/JPEG，必须强制转为 PNG，否则水印会被有损压缩抹除
+    let outputExt = path.extname(file.originalName) || '.png';
+
+    // 检查是否需要强制转 PNG (LSB算法 必须 PNG)
+    const isLossyFormat = ['.jpg', '.jpeg', '.webp'].includes(outputExt.toLowerCase());
+    if (algorithm.startsWith('LSB') || isLossyFormat) {
+        outputExt = '.png';
+    }
+
+    const processedFilename = `watermarked_${fileId}${outputExt}`;
+    // -------------------
+    const finalOutputPath = path.resolve(path.join(OUTPUT_DIR, processedFilename));
     const watermarkData = customWatermarkText || `USER-${fileId.substring(0, 6).toUpperCase()}`;
 
     try {
-        console.log(`[Node] Calling C++ Service for ${algorithm}. Data: ${watermarkData}`);
+        console.log(`[Node] Calling C++ Service for ${algorithm}. Output: ${finalOutputPath}`);
 
-        // 3. 调用 C++ 微服务
         const cppResponse = await axios.post(`${CPP_SERVICE_URL}/process`, {
             inputPath: path.resolve(file.uploadPath),
-            outputPath: path.resolve(finalOutputPath), // 最终文件的路径
+            outputPath: finalOutputPath,
             algorithm: algorithm,
             watermarkData: watermarkData
         });
@@ -96,15 +173,14 @@ app.post('/api/process', async (req, res) => {
         if (cppResponse.data.success) {
             const { success, previewPath, ...evidenceData } = cppResponse.data;
             const evidenceJson = JSON.stringify(evidenceData);
+            const absolutePreviewPath = previewPath ? path.resolve(previewPath) : null;
 
-            // 4. 更新数据库，存储预览路径和最终输出路径
             db.prepare(`
                 UPDATE files 
                 SET processedName = ?, outputPath = ?, algorithmResult = ?, customWatermarkText = ?, previewFilePath = ? 
                 WHERE id = ?
-            `).run(processedFilename, finalOutputPath, evidenceJson, watermarkData, previewPath, fileId);
+            `).run(processedFilename, finalOutputPath, evidenceJson, watermarkData, absolutePreviewPath, fileId);
 
-            // 返回预览 URL
             res.json({
                 success: true,
                 previewUrl: `/api/preview/${fileId}`,
@@ -123,17 +199,21 @@ app.post('/api/process', async (req, res) => {
     }
 });
 
-// 3. 预览图片 (修正逻辑：从数据库获取精确路径)
+// 3. 预览图片
 app.get('/api/preview/:id', (req, res) => {
-    const file = db.prepare('SELECT previewFilePath FROM files WHERE id = ?').get(req.params.id);
+    const file = db.prepare('SELECT previewFilePath, outputPath FROM files WHERE id = ?').get(req.params.id);
+    if (!file) return res.status(404).send('File not found');
 
-    const finalPath = file && file.previewFilePath ? file.previewFilePath : path.join(OUTPUT_DIR, `${req.params.id}_preview.png`);
-
-    if (!file || !fs.existsSync(finalPath)) {
-        console.error(`Preview file not found at: ${finalPath}. DB record: ${JSON.stringify(file)}`);
-        return res.status(404).send('Preview image not found');
+    let targetPath = file.previewFilePath;
+    if (!targetPath || !fs.existsSync(targetPath)) {
+        targetPath = file.outputPath;
     }
-    res.sendFile(finalPath);
+
+    if (targetPath && fs.existsSync(targetPath)) {
+        res.sendFile(path.resolve(targetPath));
+    } else {
+        res.status(404).send('Preview image generation failed');
+    }
 });
 
 // 4. 发起支付
@@ -143,7 +223,7 @@ app.post('/api/pay', async (req, res) => {
     if (!file) return res.status(404).json({ error: 'File not found' });
 
     const outTradeNo = `${fileId}_${Date.now()}`;
-    const amount = '5.00';
+    const amount = '4.99';
 
     try {
         const result = await alipaySdk.pageExec('alipay.trade.page.pay', {
@@ -169,15 +249,17 @@ app.post('/api/pay', async (req, res) => {
 // 5. 支付宝回调
 app.post('/api/payment/notify', (req, res) => {
     const params = req.body;
-    const checkResult = alipaySdk.checkNotifySign(params);
-
-    if (checkResult) {
-        if (['TRADE_SUCCESS', 'TRADE_FINISHED'].includes(params.trade_status)) {
+    try {
+        const checkResult = alipaySdk.checkNotifySign(params);
+        if (checkResult && ['TRADE_SUCCESS', 'TRADE_FINISHED'].includes(params.trade_status)) {
             const fileId = params.out_trade_no.split('_')[0];
             db.prepare('UPDATE files SET isPaid = 1 WHERE id = ?').run(fileId);
+            res.send('success');
+        } else {
+            res.send('fail');
         }
-        res.send('success');
-    } else {
+    } catch (e) {
+        console.error("Alipay Notify Error", e);
         res.send('fail');
     }
 });
@@ -189,10 +271,44 @@ app.get('/api/download/:id', (req, res) => {
 
     if (file.isPaid !== 1) return res.status(403).send('Payment required to download full resolution report');
 
-    res.download(file.outputPath, `Sentinel_Protected_${file.originalName}`);
+    const ext = path.extname(file.originalName);
+    let baseName = path.basename(file.originalName, ext);
+
+    // 清理旧前缀
+    baseName = baseName.replace(/^(Sentinel_Protected_)+/, '');
+
+    // 构建水印后缀
+    let watermarkSuffix = '';
+    if (file.customWatermarkText) {
+        watermarkSuffix = `_${file.customWatermarkText}`;
+    }
+
+    const finalFileName = `${baseName}${watermarkSuffix}${ext}`;
+
+    // --- 【下载头优化 START】 ---
+    const encodedFileName = encodeURIComponent(finalFileName);
+
+    // 1. Access-Control-Expose-Headers: 允许前端获取文件名 (如果是 AJAX 下载)
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+
+    // 2. 规范的 Content-Disposition:
+    // filename: 设置一个默认名（避免旧浏览器乱码，虽然现在很少见）
+    // filename*: RFC 5987 标准，现代浏览器优先读取这个
+    res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="download${ext}"; filename*=UTF-8''${encodedFileName}`
+    );
+    // --- 【下载头优化 END】 ---
+
+    res.sendFile(file.outputPath, (err) => {
+        if (err) {
+            console.error('Download error:', err);
+            if (!res.headersSent) res.status(500).send('Download failed');
+        }
+    });
 });
 
-// 7. 免费流程：文件上传（专用于验证）
+// 7. 免费流程：文件上传
 app.post('/api/upload_verify', upload.single('image'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: '请选择文件' });
     const fileId = path.parse(req.file.filename).name;
@@ -210,10 +326,9 @@ app.post('/api/upload_verify', upload.single('image'), (req, res) => {
     }
 });
 
-// 8. 免费流程：水印验证/查询接口 (*** 核心修正：智能选择验证目标路径 ***)
+// 8. 免费流程：水印验证
 app.post('/api/verify_watermark_free', async (req, res) => {
     const { fileId } = req.body;
-
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
     if (!file) return res.status(404).json({ error: '文件不存在' });
 
@@ -227,31 +342,24 @@ app.post('/api/verify_watermark_free', async (req, res) => {
             inputPath: path.resolve(targetPath)
         });
 
-        // [核心修改]：无论 C++ 返回 true 还是 false，只要 HTTP 请求成功，都视为 API 调用成功
-        // 我们通过 extractedText 是否为空来判断有没有水印
         if (cppResponse.data.success) {
-            // 情况 A: 成功提取到水印
             res.json({
                 success: true,
-                found: true, // 明确标记找到了
+                found: true,
                 extractedText: cppResponse.data.extractedText,
                 confidenceScore: cppResponse.data.confidenceScore
             });
         } else {
-            // 情况 B: C++ 运行正常，但没发现水印 (Magic Header 不匹配)
-            // 不抛出 Error，而是返回正常 JSON，告诉前端“没找到”
             res.json({
                 success: true,
-                found: false, // 明确标记没找到
+                found: false,
                 extractedText: null,
                 confidenceScore: 0,
                 message: "未检测到有效数字水印"
             });
         }
-
     } catch (err) {
         console.error('Verification Error:', err.message);
-        // 只有真正的网络错误或程序崩溃才返回 500
         res.status(500).json({ error: 'System error: ' + (err.response?.data?.error || err.message) });
     }
 });
@@ -264,7 +372,8 @@ app.get('*', (req, res) => {
     else res.send('Frontend is building...');
 });
 
-// 服务器启动监听
+// 服务器启动
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+    console.log(`Cron job scheduled for daily cleanup.`);
 });
