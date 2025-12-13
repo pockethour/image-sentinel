@@ -14,6 +14,7 @@ const PORT = 8080;
 const CPP_SERVICE_URL = 'http://127.0.0.1:9000';
 
 // --- 支付宝 SDK 初始化 ---
+// 警告: 必须确保 .env 文件包含 ALIPAY_APP_ID 等密钥
 const alipaySdk = new AlipaySdk({
     appId: process.env.ALIPAY_APP_ID,
     privateKey: process.env.ALIPAY_PRIVATE_KEY,
@@ -51,19 +52,18 @@ const upload = multer({
 
 // --- API 接口 ---
 
-// 1. 上传文件
+// 1. 付费流程：原始文件上传
 app.post('/api/upload', upload.single('image'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: '请选择文件' });
-    
+
     const fileId = path.parse(req.file.filename).name;
-    
+
     try {
-        // 插入初始记录
         db.prepare(`
             INSERT INTO files (id, originalName, storedName, uploadPath, size, mimeType, createdAt)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         `).run(fileId, req.file.originalname, req.file.filename, req.file.path, req.file.size, req.file.mimetype, new Date().toISOString());
-        
+
         res.json({ success: true, fileId });
     } catch (err) {
         console.error('DB Error:', err);
@@ -71,52 +71,44 @@ app.post('/api/upload', upload.single('image'), (req, res) => {
     }
 });
 
-// 2. 核心处理 (调用 C++)
+// 2. 付费流程：核心处理 (调用 C++ 嵌入水印并生成预览)
 app.post('/api/process', async (req, res) => {
-    const { fileId, algorithm } = req.body;
-    
-    // 1. 获取文件记录
+    const { fileId, algorithm, customWatermarkText } = req.body;
+
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
     if (!file) return res.status(404).json({ error: '文件不存在' });
 
-    // 2. 准备输出路径
-    const processedFilename = `processed_${fileId}_${algorithm}.png`;
-    const outputPath = path.join(OUTPUT_DIR, processedFilename);
-    // 生成一个用于嵌入的模拟 ID (生产环境应来自用户账户)
-    const watermarkData = `USER-${fileId.substring(0, 6).toUpperCase()}`;
+    const processedFilename = `watermarked_${fileId}.png`;
+    const finalOutputPath = path.join(OUTPUT_DIR, processedFilename); // 最终下载文件的路径
+    const watermarkData = customWatermarkText || `USER-${fileId.substring(0, 6).toUpperCase()}`;
 
     try {
-        console.log(`[Node] Calling C++ Service for ${algorithm}...`);
+        console.log(`[Node] Calling C++ Service for ${algorithm}. Data: ${watermarkData}`);
 
         // 3. 调用 C++ 微服务
         const cppResponse = await axios.post(`${CPP_SERVICE_URL}/process`, {
             inputPath: path.resolve(file.uploadPath),
-            outputPath: path.resolve(outputPath),
+            outputPath: path.resolve(finalOutputPath), // 最终文件的路径
             algorithm: algorithm,
             watermarkData: watermarkData
         });
 
-        // 4. 处理 C++ 响应
         if (cppResponse.data.success) {
-            // [关键] 提取 C++ 返回的业务数据 (score, extractedId, riskLevel 等)
-            // 这里的 ...evidenceData 是 ES6 剩余参数语法，表示"除了success之外的所有字段"
-            const { success, ...evidenceData } = cppResponse.data;
-
-            // 将证据数据序列化存入数据库 (确保 database.js 中已创建 algorithmResult 列)
-            // 如果您的 DB 尚未更新结构，请先在 DB 中执行: ALTER TABLE files ADD COLUMN algorithmResult TEXT;
+            const { success, previewPath, ...evidenceData } = cppResponse.data;
             const evidenceJson = JSON.stringify(evidenceData);
 
+            // 4. 更新数据库，存储预览路径和最终输出路径
             db.prepare(`
                 UPDATE files 
-                SET processedName = ?, outputPath = ?, algorithmResult = ? 
+                SET processedName = ?, outputPath = ?, algorithmResult = ?, customWatermarkText = ?, previewFilePath = ? 
                 WHERE id = ?
-            `).run(processedFilename, outputPath, evidenceJson, fileId);
+            `).run(processedFilename, finalOutputPath, evidenceJson, watermarkData, previewPath, fileId);
 
-            // 将所有证据数据返回给前端，用于渲染"证据卡片"
-            res.json({ 
-                success: true, 
+            // 返回预览 URL
+            res.json({
+                success: true,
                 previewUrl: `/api/preview/${fileId}`,
-                ...evidenceData 
+                ...evidenceData
             });
         } else {
             throw new Error(cppResponse.data.error || 'Algorithm computation failed');
@@ -131,13 +123,17 @@ app.post('/api/process', async (req, res) => {
     }
 });
 
-// 3. 预览图片
+// 3. 预览图片 (修正逻辑：从数据库获取精确路径)
 app.get('/api/preview/:id', (req, res) => {
-    const file = db.prepare('SELECT outputPath FROM files WHERE id = ?').get(req.params.id);
-    if (!file || !file.outputPath || !fs.existsSync(file.outputPath)) {
+    const file = db.prepare('SELECT previewFilePath FROM files WHERE id = ?').get(req.params.id);
+
+    const finalPath = file && file.previewFilePath ? file.previewFilePath : path.join(OUTPUT_DIR, `${req.params.id}_preview.png`);
+
+    if (!file || !fs.existsSync(finalPath)) {
+        console.error(`Preview file not found at: ${finalPath}. DB record: ${JSON.stringify(file)}`);
         return res.status(404).send('Preview image not found');
     }
-    res.sendFile(file.outputPath);
+    res.sendFile(finalPath);
 });
 
 // 4. 发起支付
@@ -147,8 +143,7 @@ app.post('/api/pay', async (req, res) => {
     if (!file) return res.status(404).json({ error: 'File not found' });
 
     const outTradeNo = `${fileId}_${Date.now()}`;
-    // 定价策略：提升价格以显示专业度
-    const amount = '5.00'; 
+    const amount = '5.00';
 
     try {
         const result = await alipaySdk.pageExec('alipay.trade.page.pay', {
@@ -191,15 +186,77 @@ app.post('/api/payment/notify', (req, res) => {
 app.get('/api/download/:id', (req, res) => {
     const file = db.prepare('SELECT * FROM files WHERE id = ?').get(req.params.id);
     if (!file) return res.status(404).send('File not found');
-    
-    // 权限校验
+
     if (file.isPaid !== 1) return res.status(403).send('Payment required to download full resolution report');
 
-    // 下载处理后的文件
     res.download(file.outputPath, `Sentinel_Protected_${file.originalName}`);
 });
 
-// 前端托管
+// 7. 免费流程：文件上传（专用于验证）
+app.post('/api/upload_verify', upload.single('image'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: '请选择文件' });
+    const fileId = path.parse(req.file.filename).name;
+
+    try {
+        db.prepare(`
+            INSERT INTO files (id, originalName, storedName, uploadPath, size, mimeType, isPaid, createdAt)
+            VALUES (?, ?, ?, ?, ?, ?, -1, ?)
+        `).run(fileId, req.file.originalname, req.file.filename, req.file.path, req.file.size, req.file.mimetype, new Date().toISOString());
+
+        res.json({ success: true, fileId });
+    } catch (err) {
+        console.error('DB Error:', err);
+        res.status(500).json({ error: 'Database initialization failed' });
+    }
+});
+
+// 8. 免费流程：水印验证/查询接口 (*** 核心修正：智能选择验证目标路径 ***)
+app.post('/api/verify_watermark_free', async (req, res) => {
+    const { fileId } = req.body;
+
+    const file = db.prepare('SELECT * FROM files WHERE id = ?').get(fileId);
+    if (!file) return res.status(404).json({ error: '文件不存在' });
+
+    let targetPath = file.uploadPath;
+    if (file.outputPath && fs.existsSync(file.outputPath)) {
+        targetPath = file.outputPath;
+    }
+
+    try {
+        const cppResponse = await axios.post(`${CPP_SERVICE_URL}/verify`, {
+            inputPath: path.resolve(targetPath)
+        });
+
+        // [核心修改]：无论 C++ 返回 true 还是 false，只要 HTTP 请求成功，都视为 API 调用成功
+        // 我们通过 extractedText 是否为空来判断有没有水印
+        if (cppResponse.data.success) {
+            // 情况 A: 成功提取到水印
+            res.json({
+                success: true,
+                found: true, // 明确标记找到了
+                extractedText: cppResponse.data.extractedText,
+                confidenceScore: cppResponse.data.confidenceScore
+            });
+        } else {
+            // 情况 B: C++ 运行正常，但没发现水印 (Magic Header 不匹配)
+            // 不抛出 Error，而是返回正常 JSON，告诉前端“没找到”
+            res.json({
+                success: true,
+                found: false, // 明确标记没找到
+                extractedText: null,
+                confidenceScore: 0,
+                message: "未检测到有效数字水印"
+            });
+        }
+
+    } catch (err) {
+        console.error('Verification Error:', err.message);
+        // 只有真正的网络错误或程序崩溃才返回 500
+        res.status(500).json({ error: 'System error: ' + (err.response?.data?.error || err.message) });
+    }
+});
+
+// 9. 前端托管
 app.use(express.static(CLIENT_DIST_DIR));
 app.get('*', (req, res) => {
     const indexHtml = path.join(CLIENT_DIST_DIR, 'index.html');
@@ -207,6 +264,7 @@ app.get('*', (req, res) => {
     else res.send('Frontend is building...');
 });
 
+// 服务器启动监听
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });

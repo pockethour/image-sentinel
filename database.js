@@ -5,6 +5,8 @@ const path = require('path');
 const db = new Database('sentinel.db', { verbose: console.log });
 
 // 初始化表结构
+// 注意：如果您的数据库文件已存在，此处的 CREATE TABLE IF NOT EXISTS 将不会执行。
+// 您可能需要手动执行 ALTER TABLE 命令来添加新字段。
 db.exec(`
   CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
@@ -16,7 +18,14 @@ db.exec(`
     size INTEGER,
     mimeType TEXT,
     isPaid INTEGER DEFAULT 0,
-    createdAt TEXT
+    createdAt TEXT,
+    
+    -- [已添加] 存储用户自定义的水印内容
+    customWatermarkText TEXT, 
+    -- [已添加] 存储 C++ 服务返回的 JSON 证据（如 score, robustness）
+    algorithmResult TEXT,
+    -- [新增] 存储 C++ 服务生成的**高保真预览图**的精确路径
+    previewFilePath TEXT 
   )
 `);
 
